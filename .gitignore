@@ -3,6 +3,12 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Data folder
+sdc2023
+
+# pt models
+*.pt
+
 # C extensions
 *.so
 
