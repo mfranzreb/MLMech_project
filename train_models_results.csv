@@ -1,0 +1,1 @@
+model_type,num_params,training_loss,val_loss,test_loss,inf_time,kaggle_score,kaggle_test_score,epochs
