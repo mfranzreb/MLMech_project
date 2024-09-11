@@ -9,7 +9,7 @@
             "type": "debugpy",
             "request": "launch",
             "program": "${file}",
-            "args": ["--num_trainable_params", "3000"],
+            "args": ["--num_trainable_params", "30000"],
             "console": "integratedTerminal"
         }
     ]

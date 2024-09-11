@@ -2,9 +2,9 @@ import glob
 import argparse
 import csv
 from dataclasses import dataclass
+import time
 import numpy as np
 import pandas as pd
-from tqdm.notebook import tqdm
 from scipy.interpolate import InterpolatedUnivariateSpline
 from sklearn.model_selection import train_test_split
 
@@ -71,9 +71,6 @@ def ECEF_to_BLH(ecef: ECEF) -> BLH:
     L = np.arctan2(y, x)
     n = a / np.sqrt(1 - e2 * np.sin(B) ** 2)
     H = (r / np.cos(B)) - n
-    # convert to degrees
-    B = np.rad2deg(B)
-    L = np.rad2deg(L)
     return BLH(lat=B, lng=L, hgt=H)
 
 
@@ -88,14 +85,12 @@ def haversine_distance(blh_1: BLH, blh_2: BLH) -> np.ndarray:
     Returns:
         np.ndarray: Haversine distance between the two sets of points.
     """
-    lat_1 = np.deg2rad(blh_1.lat)
-    lng_1 = np.deg2rad(blh_1.lng)
-    lat_2 = np.deg2rad(blh_2.lat)
-    lng_2 = np.deg2rad(blh_2.lng)
-
-    dlat = lat_2 - lat_1
-    dlng = lng_2 - lng_1
-    a = np.sin(dlat / 2) ** 2 + np.cos(lat_1) * np.cos(lat_2) * np.sin(dlng / 2) ** 2
+    dlat = blh_2.lat - blh_1.lat
+    dlng = blh_2.lng - blh_1.lng
+    a = (
+        np.sin(dlat / 2) ** 2
+        + np.cos(blh_1.lat) * np.cos(blh_2.lat) * np.sin(dlng / 2) ** 2
+    )
     dist = 2 * HAVERSINE_RADIUS * np.arcsin(np.sqrt(a))
     return dist
 
@@ -165,20 +160,20 @@ def ecef_to_lat_lng(
     )
 
 
-def calc_score(pred_df: pd.DataFrame, gt_df: pd.DataFrame) -> float:
+def calc_score(pred_blh: BLH, gt_blh: BLH) -> float:
     """
     Calculate the score of the predicted trajectory.
 
     Args:
-        pred_df (pd.DataFrame): Predicted trajectory.
-        gt_df (pd.DataFrame): Ground truth trajectory.
+        pred_blh (BLH): Predicted trajectory.
+        gt_blh (BLH): Ground truth trajectory.
 
     Returns:
         float: Score of the predicted trajectory.
     """
-    d = pandas_haversine_distance(pred_df, gt_df)
+    d = haversine_distance(pred_blh, gt_blh)
     score = np.mean([np.quantile(d, 0.50), np.quantile(d, 0.95)])
-    return score
+    return d.mean(), score
 
 
 def print_comparison(lat, lng, gt_lat, gt_lng):
@@ -296,6 +291,10 @@ class TransformerEncoder(torch.nn.Module):
         num_layers = int(
             (num_trainable_params - fc_trainable_params) / layer_trainable_params
         )
+        if abs(num_trainable_params - num_layers * layer_trainable_params) > abs(
+            num_trainable_params - (num_layers + 1) * layer_trainable_params
+        ):
+            num_layers += 1
         self.transformer = torch.nn.TransformerEncoder(
             transformer_layer, num_layers=num_layers
         )
@@ -305,7 +304,7 @@ class TransformerEncoder(torch.nn.Module):
                 num_trainable_params
                 - sum(p.numel() for p in self.parameters() if p.requires_grad)
             )
-            < num_trainable_params / 40
+            < num_trainable_params / 20
         ), f"Number of trainable parameters of transformer is not equal to {num_trainable_params}"
 
     def forward(self, x):
@@ -369,6 +368,10 @@ class LSTMEncoder(torch.nn.Module):
         num_layers = int(
             (num_trainable_params - fc_trainable_params) / layer_trainable_params
         )
+        if abs(num_trainable_params - num_layers * layer_trainable_params) > abs(
+            num_trainable_params - (num_layers + 1) * layer_trainable_params
+        ):
+            num_layers += 1
         # Stack of LSTM layers
         self.lstm = torch.nn.LSTM(
             input_size=config.d_model,
@@ -381,7 +384,7 @@ class LSTMEncoder(torch.nn.Module):
                 num_trainable_params
                 - sum(p.numel() for p in self.parameters() if p.requires_grad)
             )
-            < num_trainable_params / 40
+            < num_trainable_params / 20
         ), f"Number of trainable parameters of LSTM is not equal to {num_trainable_params}"
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -415,40 +418,47 @@ class MLP(torch.nn.Module):
         d_model = config.d_model
         output_dim = config.output_dim
 
-        seq_model = nn.Sequential()
-
+        self.layers = nn.Sequential()
         i = 0
         total_params = 0
-        seq_model.add_module(f"fc_{i}", nn.Linear(input_dim, d_model))
-        seq_model.add_module(f"relu_{i}", nn.ReLU())
 
+        # Initial input layer
+        self.layers.add_module(f"fc_{i}", nn.Linear(input_dim, d_model))
+        self.layers.add_module(f"relu_{i}", nn.ReLU())
+        i += 1
+
+        output_layer = nn.Linear(d_model, output_dim)
         while True:
-            # Add a linear layer
-            seq_model.add_module(f"fc_{i}", nn.Linear(d_model, d_model))
-            seq_model.add_module(f"relu_{i}", nn.ReLU())
+            # Add hidden layers
+            self.layers.add_module(f"fc_{i}", nn.Linear(d_model, d_model))
+            self.layers.add_module(f"relu_{i}", nn.ReLU())
 
-            # Calculate total parameters
-            total_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+            new_model = nn.Sequential(self.layers, output_layer)
+
+            new_model_params = sum(
+                p.numel() for p in new_model.parameters() if p.requires_grad
+            )
 
             # Check if adding an output layer would reach num_trainable_params
-            output_layer = nn.Linear(d_model, output_dim)
-            output_params = output_layer.weight.numel() + output_layer.bias.numel()
-
             if (
-                abs(num_trainable_params - (total_params + output_params))
-                < num_trainable_params / 40
-            ):
-                seq_model.add_module(f"fc_{i}", nn.Linear(d_model, output_dim))
-                self.layers = seq_model
+                abs(num_trainable_params - (new_model_params))
+                < num_trainable_params / 20
+            ) or (
+                new_model_params > num_trainable_params
+            ):  # If second condition is true, it will fail the assert
+                self.layers = new_model
                 break
+
+            i += 1
 
         assert (
             abs(
                 num_trainable_params
                 - sum(p.numel() for p in self.parameters() if p.requires_grad)
             )
-            < num_trainable_params / 40
+            < num_trainable_params / 20
         ), f"Number of trainable parameters of MLP is not equal to {num_trainable_params}"
+
 
     def forward(self, x):
         return self.layers(x)
@@ -566,26 +576,29 @@ class GNSSDataset(torch.utils.data.Dataset):
         return self.sequences.shape[0]
 
 
-def is_converged(val_losses):
+def is_converged(mean_dists):
     """
     Check if the last 10 val losses have a standard deviation of less than.
     Args:
-        val_losses (list): List of validation losses.
+        mean_dists (list): List of validation losses.
     Returns:
         bool: True if the validation loss has converged, False otherwise.
     """
-    if len(val_losses) < 10:
+    if len(mean_dists) < 10:
         return False
-    return np.std(val_losses[-10:]) < 1.0  # TODO: maybe needs readjusting
+    return np.std(mean_dists[-10:]) < 1.0  # TODO: maybe needs readjusting
 
 
 def save_results(
     save_path,
     model_type,
+    lr,
     num_params,
     training_loss,
+    best_loss,
     val_loss,
     test_loss,
+    training_time,
     inf_time,
     kaggle_score,
     kaggle_test_score,
@@ -600,10 +613,13 @@ def save_results(
     """
     row = [
         model_type,
+        lr,
         num_params,
         training_loss,
+        best_loss,
         val_loss,
         test_loss,
+        training_time,
         inf_time,
         kaggle_score,
         kaggle_test_score,
@@ -619,12 +635,15 @@ def val_model(model, loader, loss_fn):
     mean_score = 0
     count = 0
     losses = []
+    mean_dists = []
+    mean_scores = []
     inf_time = 0.0
     starter = torch.cuda.Event(enable_timing=True)
     ender = torch.cuda.Event(enable_timing=True)
+
     for features, labels in loader:
-        #                 print(features.shape)
-        #                 print(features[0, :20])
+        # print(features.shape)
+        # print(features[0, :20])
         features = features.to(device)
         labels = labels.to(device)
 
@@ -640,38 +659,25 @@ def val_model(model, loader, loss_fn):
         features = features.detach().cpu()  # * 180
         pred = pred.detach().cpu()  # * 180
         labels = labels.detach().cpu()  # * 180
-        print(pred.shape)
+        # print(pred.shape)
         pred_lats = pred[:, :, 0] + features[:, :, 0]
         pred_lngs = pred[:, :, 1] + features[:, :, 1]
         gt_lats = labels[:, :, 0] + features[:, :, 0]
         gt_lns = labels[:, :, 1] + features[:, :, 1]
 
-        start = 60
-        cutoff = 65
-        # print some samples
-        print_batch(
-            1,
-            pred_lats[:, start:cutoff],
-            pred_lngs[:, start:cutoff],
-            gt_lats[:, start:cutoff],
-            gt_lns[:, start:cutoff],
-        )
-
         # Calculate score according to kaggle, height not necessary for distance
-        blh1 = BLH(pred_lats, pred_lngs, hgt=0)
-        blh2 = BLH(gt_lats, gt_lns, hgt=0)
-        d = haversine_distance(blh1, blh2)
-        mean_score += np.mean([np.quantile(d, 0.50), np.quantile(d, 0.95)])
-        mean_dist += d.mean()
+        blh1 = BLH(np.deg2rad(pred_lats), np.deg2rad(pred_lngs), hgt=0)
+        blh2 = BLH(np.deg2rad(gt_lats), np.deg2rad(gt_lns), hgt=0)
 
-        features = features.cpu()
-        labels = labels.cpu()
+        mean_dist, mean_score = calc_score(blh1, blh2)
+        mean_dists.append(mean_dist)
+        mean_scores.append(mean_score)
         count += 1
 
     return (
         np.array(losses).mean(),
-        mean_dist / count,
-        mean_score / count,
+        np.array(mean_dists).mean(),
+        np.array(mean_scores).mean(),
         inf_time / count,
     )
 
@@ -684,12 +690,13 @@ def train_model(
     test_loader,
     config,
     device,
+    epochs,
+    lr,
 ):
-    epochs = 10000  # number of epochs
-    n_eval = 10  # evaluate every n_eval epochs
-    lr = 0.0005  # learning rate
+    n_eval = 4  # evaluate every n_eval epochs
 
     PATH = "model.pt"
+
     best_loss = 99999999  # high number
 
     for num_trainable_params in num_trainable_params_list:
@@ -707,69 +714,68 @@ def train_model(
         loss_fn = torch.nn.MSELoss()
 
         val_losses = []
+        mean_dists = []
         converged = False
+        start_time = time.time()
+        loss = 0
         for epoch in range(epochs):
+            if converged:
+                break
             print(f"Epoch {epoch + 1} of {epochs}")
-
+            print(f"Loss/train {loss}")
             # Loop over each batch in the dataset
-            for batch in tqdm(train_loader):
-
+            for batch in train_loader:
                 optimizer.zero_grad()  # If not, the gradients would sum up over each iteration
 
                 # Unpack the data and labels
                 features, labels = batch
-
                 features = features.to(device)
                 labels = labels.to(device)
 
                 # Forward propagate
-
                 outputs = model(features)
 
                 # Backpropagation and gradient descent
-
                 loss = loss_fn(outputs, labels)
 
                 loss.backward()
                 optimizer.step()
 
-                print(f"Loss/train {loss}")
+            # Periodically evaluate our model + log to Tensorboard
+            if epoch % n_eval == 0:
+                model.eval()
+                val_loss, mean_dist, mean_score, _ = val_model(
+                    model, val_loader, loss_fn
+                )
+                val_losses.append(val_loss)
+                mean_dists.append(mean_dist)
 
-                # Periodically evaluate our model + log to Tensorboard
-                if epoch % n_eval == 0:
-                    # Compute training loss and metrics
+                if val_loss < best_loss:
+                    best_loss = val_loss
 
-                    model.eval()
-                    val_loss, mean_dist, mean_score, _ = val_model(
-                        model, val_loader, loss_fn
+                    torch.save(
+                        {
+                            "epoch": epoch,
+                            "model_state_dict": model.state_dict(),
+                            "optimizer_state_dict": optimizer.state_dict(),
+                            "loss": val_loss,
+                        },
+                        PATH,
                     )
-                    val_losses.append(val_loss)
 
-                    if val_loss < best_loss:
-                        best_loss = val_loss
+                print(f"Val mean dist {mean_dist}")
+                print(f"Val mean score {mean_score}")
+                print(f"Loss/val {val_loss}")
 
-                        torch.save(
-                            {
-                                "epoch": epoch,
-                                "model_state_dict": model.state_dict(),
-                                "optimizer_state_dict": optimizer.state_dict(),
-                                "loss": val_loss,
-                            },
-                            PATH,
-                        )
+                converged = is_converged(mean_dists)
 
-                    print(f"Val mean dist {mean_dist}")
-                    print(f"Val mean score {mean_score}")
-                    print(f"Loss/val {val_loss}")
-
-                    converged = is_converged(val_losses)
-
-                    # turn on training, evaluate turns off training
-                    model.train()
+                # turn on training, evaluate turns off training
+                model.train()
 
                 if converged:
                     break
 
+        end_time = time.time()
         # Get test loss and inference time
         model.eval()
         test_loss, mean_dist, mean_test_score, inf_time = val_model(
@@ -779,13 +785,16 @@ def train_model(
         save_results(
             SAVE_PATH,
             model.name,
+            lr,
             num_trainable_params,
             float(loss.cpu()),
+            best_loss,
             val_loss,
             test_loss,
+            end_time - start_time,
+            inf_time,
             mean_score,
             mean_test_score,
-            inf_time,
             epoch,
         )
 
@@ -804,6 +813,7 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(device)
+    torch.cuda.memory._record_memory_history()
 
     pred_dfs = []
     gt_dfs = []
@@ -830,7 +840,6 @@ if __name__ == "__main__":
         pred_df = ecef_to_lat_lng(tripID, gnss_df, gt_df["UnixTimeMillis"])
         pred_df = pd.merge(pred_df, info_df, on="utcTimeMillis", how="left")
         gt_df = gt_df[["LatitudeDegrees", "LongitudeDegrees"]]
-        print(tripID)
         #     print(pred_df.shape)
         #     print(gt_df.shape)
         pred_dfs.append(pred_df)
@@ -871,28 +880,32 @@ if __name__ == "__main__":
     test_dataset = GNSSDataset(X_test, y_test)
 
     train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=32, shuffle=True
+        train_dataset, batch_size=2, shuffle=True
     )
-    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=32, shuffle=True)
-    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=32, shuffle=True)
-    train_model(
-        "LSTM",
-        num_trainable_params_list,
-        train_loader,
-        val_loader,
-        test_loader,
-        config,
-        device,
-    )
-    train_model(
-        "Transformer",
-        num_trainable_params_list,
-        train_loader,
-        val_loader,
-        test_loader,
-        config,
-        device,
-    )
+    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=2, shuffle=True)
+    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=2, shuffle=True)
+    # train_model(
+    #    "LSTM",
+    #    num_trainable_params_list,
+    #    train_loader,
+    #    val_loader,
+    #    test_loader,
+    #    config,
+    #    device,
+    #    epochs=10000,
+    #    lr=0.001,
+    # )
+    # train_model(
+    #    "Transformer",
+    #    num_trainable_params_list,
+    #    train_loader,
+    #    val_loader,
+    #    test_loader,
+    #    config,
+    #    device,
+    #    epochs=10000,
+    #    lr=0.001,
+    # )
     train_model(
         "MLP",
         num_trainable_params_list,
@@ -901,4 +914,6 @@ if __name__ == "__main__":
         test_loader,
         config,
         device,
+        epochs=10000,
+        lr=0.001,
     )
