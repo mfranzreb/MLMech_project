@@ -1,0 +1,1 @@
+model_type,learning rate,num_params,training_loss,best_loss,val_loss,test_loss,training_time,inf_time,kaggle_score,kaggle_test_score,epochs,batch_size,regularization

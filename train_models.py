@@ -23,7 +23,7 @@ WGS84_SQUARED_SECOND_ECCENTRICITY = 6.73949674226e-3
 
 HAVERSINE_RADIUS = 6_371_000
 
-SAVE_PATH = "train_models_results.csv"
+SAVE_PATH = "train_models_results_new.csv"
 
 
 @dataclass
@@ -459,7 +459,6 @@ class MLP(torch.nn.Module):
             < num_trainable_params / 20
         ), f"Number of trainable parameters of MLP is not equal to {num_trainable_params}"
 
-
     def forward(self, x):
         return self.layers(x)
 
@@ -602,7 +601,11 @@ def save_results(
     inf_time,
     kaggle_score,
     kaggle_test_score,
+    mean_dist,
+    mean_test_dist,
     epochs,
+    batch_size,
+    use_reg,
 ):
     """
     Add the training results to a CSV file.
@@ -623,14 +626,18 @@ def save_results(
         inf_time,
         kaggle_score,
         kaggle_test_score,
+        mean_dist,
+        mean_test_dist,
         epochs,
+        batch_size,
+        use_reg,
     ]
     with open(save_path, "a") as file:
         writer = csv.writer(file)
         writer.writerow(row)
 
 
-def val_model(model, loader, loss_fn):
+def val_model(model, loader, loss_fn, test=False):
     mean_dist = 0
     mean_score = 0
     count = 0
@@ -640,10 +647,7 @@ def val_model(model, loader, loss_fn):
     inf_time = 0.0
     starter = torch.cuda.Event(enable_timing=True)
     ender = torch.cuda.Event(enable_timing=True)
-
     for features, labels in loader:
-        # print(features.shape)
-        # print(features[0, :20])
         features = features.to(device)
         labels = labels.to(device)
 
@@ -674,6 +678,14 @@ def val_model(model, loader, loss_fn):
         mean_scores.append(mean_score)
         count += 1
 
+    # Use median since there is one test batch that gives weird results
+    if test == True:
+        return (
+            np.median(np.array(losses)),
+            np.median(np.array(mean_dists)),
+            np.median(np.array(mean_scores)),
+            inf_time / count,
+        )
     return (
         np.array(losses).mean(),
         np.array(mean_dists).mean(),
@@ -684,7 +696,7 @@ def val_model(model, loader, loss_fn):
 
 def train_model(
     model_type,
-    num_trainable_params_list,
+    num_trainable_params,
     train_loader,
     val_loader,
     test_loader,
@@ -692,6 +704,7 @@ def train_model(
     device,
     epochs,
     lr,
+    use_reg,
 ):
     n_eval = 4  # evaluate every n_eval epochs
 
@@ -699,117 +712,139 @@ def train_model(
 
     best_loss = 99999999  # high number
 
-    for num_trainable_params in num_trainable_params_list:
-        if model_type == "LSTM":
-            model = LSTMEncoder(config, num_trainable_params)
-        elif model_type == "Transformer":
-            model = TransformerEncoder(config, num_trainable_params)
-        elif model_type == "MLP":
-            model = MLP(config, num_trainable_params)
-        else:
-            raise ValueError(f"Model type {model_type} is not supported.")
-        model.to(device)
+    # Regularization strength
+    lambda_l1 = 0.1
+    lambda_l2 = 0.25
 
-        optimizer = torch.optim.Adam(params=model.parameters(), lr=lr)
-        loss_fn = torch.nn.MSELoss()
+    if model_type == "LSTM":
+        model = LSTMEncoder(config, num_trainable_params)
+    elif model_type == "Transformer":
+        model = TransformerEncoder(config, num_trainable_params)
+    elif model_type == "MLP":
+        model = MLP(config, num_trainable_params)
+    else:
+        raise ValueError(f"Model type {model_type} is not supported.")
+    model.to(device)
 
-        val_losses = []
-        mean_dists = []
-        converged = False
-        start_time = time.time()
-        loss = 0
-        for epoch in range(epochs):
+    optimizer = torch.optim.Adam(params=model.parameters(), lr=lr)
+    loss_fn = torch.nn.MSELoss()
+
+    val_losses = []
+    mean_dists = []
+    converged = False
+    start_time = time.time()
+    loss = 0
+    for epoch in range(epochs):
+        if converged:
+            break
+        print(f"Epoch {epoch + 1} of {epochs}")
+        print(f"Loss/train {loss}")
+        # Loop over each batch in the dataset
+        for batch in train_loader:
+            optimizer.zero_grad()  # If not, the gradients would sum up over each iteration
+
+            # Unpack the data and labels
+            features, labels = batch
+            features = features.to(device)
+            labels = labels.to(device)
+
+            # Forward propagate
+            outputs = model(features)
+
+            # Backpropagation and gradient descent
+            loss = loss_fn(outputs, labels)
+
+            if use_reg:
+                # L1 regularization
+                l1_reg = sum(param.abs().sum() for param in model.parameters())
+                # L2 regularization
+                l2_reg = sum(param.pow(2).sum() for param in model.parameters())
+
+                # Add the regularization terms to the loss
+                loss += lambda_l1 * l1_reg + lambda_l2 * l2_reg
+
+            loss.backward()
+            optimizer.step()
+
+        # Periodically evaluate our model + log to Tensorboard
+        if epoch % n_eval == 0:
+            model.eval()
+            val_loss, mean_dist, mean_score, _ = val_model(model, val_loader, loss_fn)
+            val_losses.append(val_loss)
+            mean_dists.append(mean_dist)
+
+            if val_loss < best_loss:
+                best_loss = val_loss
+
+                torch.save(
+                    {
+                        "epoch": epoch,
+                        "model_state_dict": model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "loss": val_loss,
+                    },
+                    PATH,
+                )
+
+            print(f"Val mean dist {mean_dist}")
+            print(f"Val mean score {mean_score}")
+            print(f"Loss/val {val_loss}")
+
+            converged = is_converged(mean_dists)
+
+            # turn on training, evaluate turns off training
+            model.train()
+
             if converged:
                 break
-            print(f"Epoch {epoch + 1} of {epochs}")
-            print(f"Loss/train {loss}")
-            # Loop over each batch in the dataset
-            for batch in train_loader:
-                optimizer.zero_grad()  # If not, the gradients would sum up over each iteration
 
-                # Unpack the data and labels
-                features, labels = batch
-                features = features.to(device)
-                labels = labels.to(device)
+    end_time = time.time()
+    # Get test loss and inference time
+    model.eval()
+    test_loss, mean_test_dist, mean_test_score, inf_time = val_model(
+        model, test_loader, loss_fn, test=True
+    )
 
-                # Forward propagate
-                outputs = model(features)
-
-                # Backpropagation and gradient descent
-                loss = loss_fn(outputs, labels)
-
-                loss.backward()
-                optimizer.step()
-
-            # Periodically evaluate our model + log to Tensorboard
-            if epoch % n_eval == 0:
-                model.eval()
-                val_loss, mean_dist, mean_score, _ = val_model(
-                    model, val_loader, loss_fn
-                )
-                val_losses.append(val_loss)
-                mean_dists.append(mean_dist)
-
-                if val_loss < best_loss:
-                    best_loss = val_loss
-
-                    torch.save(
-                        {
-                            "epoch": epoch,
-                            "model_state_dict": model.state_dict(),
-                            "optimizer_state_dict": optimizer.state_dict(),
-                            "loss": val_loss,
-                        },
-                        PATH,
-                    )
-
-                print(f"Val mean dist {mean_dist}")
-                print(f"Val mean score {mean_score}")
-                print(f"Loss/val {val_loss}")
-
-                converged = is_converged(mean_dists)
-
-                # turn on training, evaluate turns off training
-                model.train()
-
-                if converged:
-                    break
-
-        end_time = time.time()
-        # Get test loss and inference time
-        model.eval()
-        test_loss, mean_dist, mean_test_score, inf_time = val_model(
-            model, test_loader, loss_fn
-        )
-
-        save_results(
-            SAVE_PATH,
-            model.name,
-            lr,
-            num_trainable_params,
-            float(loss.cpu()),
-            best_loss,
-            val_loss,
-            test_loss,
-            end_time - start_time,
-            inf_time,
-            mean_score,
-            mean_test_score,
-            epoch,
-        )
+    save_results(
+        SAVE_PATH,
+        model.name,
+        lr,
+        num_trainable_params,
+        float(loss.cpu()),
+        best_loss,
+        val_loss,
+        test_loss,
+        end_time - start_time,
+        inf_time,
+        mean_score,
+        mean_test_score,
+        mean_dist,
+        mean_test_dist,
+        epoch,
+        2,
+        use_reg,
+    )
 
 
 if __name__ == "__main__":
     argparser = argparse.ArgumentParser()
     argparser.add_argument(
-        "--num_trainable_params",
+        "--num_params",
         type=int,
         nargs="+",  # This allows multiple integers to be passed as a list
         required=True,  # This makes the argument mandatory
         help="List of integers representing the number of trainable parameters",
     )
+    argparser.add_argument(
+        "--lr",
+        type=float,
+        nargs="+",
+        required=True,
+        help="List of floats representing the learning rate",
+    )
     args = argparser.parse_args()
-    num_trainable_params_list = args.num_trainable_params
+    num_trainable_params_list = args.num_params
+    lr_list = args.lr
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(device)
@@ -883,37 +918,45 @@ if __name__ == "__main__":
         train_dataset, batch_size=2, shuffle=True
     )
     val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=2, shuffle=True)
-    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=2, shuffle=True)
-    # train_model(
-    #    "LSTM",
-    #    num_trainable_params_list,
-    #    train_loader,
-    #    val_loader,
-    #    test_loader,
-    #    config,
-    #    device,
-    #    epochs=10000,
-    #    lr=0.001,
-    # )
-    # train_model(
-    #    "Transformer",
-    #    num_trainable_params_list,
-    #    train_loader,
-    #    val_loader,
-    #    test_loader,
-    #    config,
-    #    device,
-    #    epochs=10000,
-    #    lr=0.001,
-    # )
-    train_model(
-        "MLP",
-        num_trainable_params_list,
-        train_loader,
-        val_loader,
-        test_loader,
-        config,
-        device,
-        epochs=10000,
-        lr=0.001,
+    test_loader = torch.utils.data.DataLoader(
+        test_dataset, batch_size=2, shuffle=True, drop_last=True
     )
+    for trainable_params in num_trainable_params_list:
+        for lr in lr_list:
+            for use_reg in [False, True]:
+                train_model(
+                    "LSTM",
+                    trainable_params,
+                    train_loader,
+                    val_loader,
+                    test_loader,
+                    config,
+                    device,
+                    epochs=1000,
+                    lr=lr,
+                    use_reg=use_reg,
+                )
+                train_model(
+                    "Transformer",
+                    trainable_params,
+                    train_loader,
+                    val_loader,
+                    test_loader,
+                    config,
+                    device,
+                    epochs=1000,
+                    lr=lr,
+                    use_reg=use_reg,
+                )
+                train_model(
+                    "MLP",
+                    trainable_params,
+                    train_loader,
+                    val_loader,
+                    test_loader,
+                    config,
+                    device,
+                    epochs=1000,
+                    lr=lr,
+                    use_reg=use_reg,
+                )
