@@ -9,7 +9,7 @@
       "type": "debugpy",
       "request": "launch",
       "program": "${file}",
-      "args": ["--num_params", "20000", "--lr", "0.001"],
+      "args": ["--num_params", "10000", "--lr", "0.001"],
       "console": "integratedTerminal"
     }
   ]
