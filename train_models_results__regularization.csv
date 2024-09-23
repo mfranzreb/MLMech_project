@@ -1,0 +1,5 @@
+model_type,learning rate,num_params,training_loss,best_loss,val_loss,test_loss,training_time,inf_time,kaggle_score,kaggle_test_score,mean_dist,mean_test_dist,epochs,batch_size,regularization
+,,,,,,,,,,,,,,,
+LSTM,0.01,3000,0.438796699,6.87E-07,7.12E-07,1.90E-08,1488.495112,0.010289536,33.44263632,21.40839767,32.947525,19.686844,999,2,TRUE
+LSTM,0.001,3000,0.038343091,6.67E-07,6.67E-07,3.95E-10,1487.644997,0.010270464,2.459396036,2.818864745,1.8092881,1.5056648,999,2,TRUE
+LSTM,0.005,3000,0.177840948,6.67E-07,6.67E-07,3.63E-10,1488.744204,0.01024512,2.537003994,2.758295411,1.809288,1.4936285,999,2,TRUE
