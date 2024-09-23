@@ -663,11 +663,23 @@ def val_model(model, loader, loss_fn, test=False):
         features = features.detach().cpu()  # * 180
         pred = pred.detach().cpu()  # * 180
         labels = labels.detach().cpu()  # * 180
-        # print(pred.shape)
         pred_lats = pred[:, :, 0] + features[:, :, 0]
         pred_lngs = pred[:, :, 1] + features[:, :, 1]
         gt_lats = labels[:, :, 0] + features[:, :, 0]
         gt_lns = labels[:, :, 1] + features[:, :, 1]
+        if test:
+            # save the coordinates of each datapoint in a dataframe
+            for i in range(pred_lats.shape[0]):
+                df = pd.DataFrame(
+                    {
+                        "gt_lat": gt_lats[i],
+                        "gt_long": gt_lns[i],
+                        "pred_lat": pred_lats[i],
+                        "pred_long": pred_lngs[i],
+                    }
+                )
+                dp = count * 2 + i  # 2 is batch size
+                df.to_csv(f"preds_{dp}.csv", index=False)
 
         # Calculate score according to kaggle, height not necessary for distance
         blh1 = BLH(np.deg2rad(pred_lats), np.deg2rad(pred_lngs), hgt=0)
@@ -825,6 +837,17 @@ def train_model(
         use_reg,
     )
 
+    # save model
+    torch.save(
+        {
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "loss": val_loss,
+        },
+        PATH,
+    )
+
 
 if __name__ == "__main__":
     argparser = argparse.ArgumentParser()
@@ -923,7 +946,7 @@ if __name__ == "__main__":
     )
     for trainable_params in num_trainable_params_list:
         for lr in lr_list:
-            for use_reg in [False, True]:
+            for use_reg in [False]:
                 train_model(
                     "LSTM",
                     trainable_params,
@@ -936,27 +959,27 @@ if __name__ == "__main__":
                     lr=lr,
                     use_reg=use_reg,
                 )
-                train_model(
-                    "Transformer",
-                    trainable_params,
-                    train_loader,
-                    val_loader,
-                    test_loader,
-                    config,
-                    device,
-                    epochs=1000,
-                    lr=lr,
-                    use_reg=use_reg,
-                )
-                train_model(
-                    "MLP",
-                    trainable_params,
-                    train_loader,
-                    val_loader,
-                    test_loader,
-                    config,
-                    device,
-                    epochs=1000,
-                    lr=lr,
-                    use_reg=use_reg,
-                )
+                # train_model(
+                #    "Transformer",
+                #    trainable_params,
+                #    train_loader,
+                #    val_loader,
+                #    test_loader,
+                #    config,
+                #    device,
+                #    epochs=1000,
+                #    lr=lr,
+                #    use_reg=use_reg,
+                # )
+                # train_model(
+                #    "MLP",
+                #    trainable_params,
+                #    train_loader,
+                #    val_loader,
+                #    test_loader,
+                #    config,
+                #    device,
+                #    epochs=1000,
+                #    lr=lr,
+                #    use_reg=use_reg,
+                # )
