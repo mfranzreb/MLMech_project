@@ -2,6 +2,9 @@ import glob
 import argparse
 import csv
 from dataclasses import dataclass
+import matplotlib.pyplot as plt
+
+plt.switch_backend("agg")
 import time
 import numpy as np
 import pandas as pd
@@ -585,7 +588,7 @@ def is_converged(mean_dists):
     """
     if len(mean_dists) < 10:
         return False
-    return np.std(mean_dists[-10:]) < 1.0  # TODO: maybe needs readjusting
+    return np.std(mean_dists[-10:]) < 0.1  # TODO: maybe needs readjusting
 
 
 def save_results(
@@ -718,7 +721,6 @@ def train_model(
     lr,
     use_reg,
 ):
-    n_eval = 4  # evaluate every n_eval epochs
 
     PATH = "model.pt"
 
@@ -743,10 +745,12 @@ def train_model(
 
     val_losses = []
     mean_dists = []
+    k_scores = []
     converged = False
     start_time = time.time()
     loss = 0
     for epoch in range(epochs):
+        count = 0
         if converged:
             break
         print(f"Epoch {epoch + 1} of {epochs}")
@@ -777,38 +781,42 @@ def train_model(
 
             loss.backward()
             optimizer.step()
+            count += 1
+
+        if epoch == 0:
+            print(count)
 
         # Periodically evaluate our model + log to Tensorboard
-        if epoch % n_eval == 0:
-            model.eval()
-            val_loss, mean_dist, mean_score, _ = val_model(model, val_loader, loss_fn)
-            val_losses.append(val_loss)
-            mean_dists.append(mean_dist)
+        model.eval()
+        val_loss, mean_dist, mean_score, _ = val_model(model, val_loader, loss_fn)
+        val_losses.append(val_loss)
+        mean_dists.append(mean_dist)
+        k_scores.append(mean_score)
 
-            if val_loss < best_loss:
-                best_loss = val_loss
+        if val_loss < best_loss:
+            best_loss = val_loss
 
-                torch.save(
-                    {
-                        "epoch": epoch,
-                        "model_state_dict": model.state_dict(),
-                        "optimizer_state_dict": optimizer.state_dict(),
-                        "loss": val_loss,
-                    },
-                    PATH,
-                )
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "loss": val_loss,
+                },
+                PATH,
+            )
 
-            print(f"Val mean dist {mean_dist}")
-            print(f"Val mean score {mean_score}")
-            print(f"Loss/val {val_loss}")
+        print(f"Val mean dist {mean_dist}")
+        print(f"Val mean score {mean_score}")
+        print(f"Loss/val {val_loss}")
 
-            converged = is_converged(mean_dists)
+        converged = is_converged(mean_dists)
 
-            # turn on training, evaluate turns off training
-            model.train()
+        # turn on training, evaluate turns off training
+        model.train()
 
-            if converged:
-                break
+        if converged:
+            break
 
     end_time = time.time()
     # Get test loss and inference time
@@ -847,6 +855,16 @@ def train_model(
         },
         PATH,
     )
+
+    # save plot of val loss, mean dist, mean score
+    plt.figure()
+    plt.plot(val_losses, label="Validation Loss")
+    plt.plot(mean_dists, label="Mean Distance")
+    plt.plot(k_scores, label="Kaggle Score")
+    plt.legend()
+    plt.xlabel("Epoch")
+    plt.yscale("log")
+    plt.savefig(f"training_plot_{model_type}_{num_trainable_params}.png")
 
 
 if __name__ == "__main__":
@@ -959,27 +977,27 @@ if __name__ == "__main__":
                     lr=lr,
                     use_reg=use_reg,
                 )
-                # train_model(
-                #    "Transformer",
-                #    trainable_params,
-                #    train_loader,
-                #    val_loader,
-                #    test_loader,
-                #    config,
-                #    device,
-                #    epochs=1000,
-                #    lr=lr,
-                #    use_reg=use_reg,
-                # )
-                # train_model(
-                #    "MLP",
-                #    trainable_params,
-                #    train_loader,
-                #    val_loader,
-                #    test_loader,
-                #    config,
-                #    device,
-                #    epochs=1000,
-                #    lr=lr,
-                #    use_reg=use_reg,
-                # )
+                train_model(
+                    "Transformer",
+                    trainable_params,
+                    train_loader,
+                    val_loader,
+                    test_loader,
+                    config,
+                    device,
+                    epochs=1000,
+                    lr=lr,
+                    use_reg=use_reg,
+                )
+                train_model(
+                    "MLP",
+                    trainable_params,
+                    train_loader,
+                    val_loader,
+                    test_loader,
+                    config,
+                    device,
+                    epochs=1000,
+                    lr=lr,
+                    use_reg=use_reg,
+                )
